@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import axios from "axios";
 import { useNavigate, useParams } from "react-router-dom";
-import { X, Edit } from "lucide-react";
+import { X, Edit, Upload } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
 // Modal component matching AddRecipe modal style
@@ -32,7 +32,7 @@ const Modal = ({ isOpen, onClose, message, success }) => {
             <p className="text-gray-300 mb-6">{message}</p>
             <div className="flex justify-end">
               <button
-                onClick={onClose}
+                onClick={() => onClose(success)}
                 className={`px-4 py-2 rounded ${
                   success
                     ? "bg-green-600 hover:bg-green-700"
@@ -55,8 +55,10 @@ const EditRecipe = () => {
     ingredients: [""],
     instructions: "",
     category: "",
-    photoUrl: "",
+    photoUrl: "", // Existing Cloudinary URL or local blob URL for preview
+    imageFile: null, // File object for upload
     cookingTime: "",
+    initialImageUrlWasPresent: false,
   });
   const { id } = useParams();
   const [error, setError] = useState("");
@@ -67,6 +69,31 @@ const EditRecipe = () => {
 
   const handleInputChange = (field, value) => {
     setFormData((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const handleFileChange = (e) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      if (formData.photoUrl && formData.photoUrl.startsWith("blob:")) {
+        try { URL.revokeObjectURL(formData.photoUrl); } catch (e) {}
+      }
+      setFormData((prev) => ({
+        ...prev,
+        imageFile: file,
+        photoUrl: URL.createObjectURL(file),
+      }));
+    }
+  };
+
+  const handleClearImage = () => {
+    if (formData.photoUrl && formData.photoUrl.startsWith("blob:")) {
+      try { URL.revokeObjectURL(formData.photoUrl); } catch (e) {}
+    }
+    setFormData((prev) => ({
+      ...prev,
+      photoUrl: "",
+      imageFile: null,
+    }));
   };
 
   const handleIngredientChange = (index, value) => {
@@ -98,43 +125,78 @@ const EditRecipe = () => {
     setError("");
     setLoading(true);
 
-    try {
-      await axios.put(`/api/recipes/${id}`, {
-        ...formData,
-        ingredients: formData.ingredients.filter((i) => i.trim() !== ""),
-        cookingTime: formData.cookingTime ? Number(formData.cookingTime) : undefined,
-      });
+    const data = new FormData();
+    data.append("title", formData.title);
+    data.append("instructions", formData.instructions);
+    data.append("category", formData.category);
+    data.append("cookingTime", formData.cookingTime ? Number(formData.cookingTime) : "");
 
+    formData.ingredients.filter((i) => i.trim() !== "").forEach((ing) => {
+      data.append("ingredients[]", ing);
+    });
+
+    if (formData.imageFile) {
+      data.append("image", formData.imageFile); // <-- MUST match multer.single("image")
+    } else if (!formData.photoUrl && formData.initialImageUrlWasPresent) {
+      data.append("clearImage", "true");
+    }
+
+    try {
+      await axios.put(`/api/recipes/${id}`, data, {
+        headers: {
+          "Content-Type": "multipart/form-data",
+          Authorization: `Bearer ${localStorage.getItem("token")}`,
+        },
+      });
       setModal({ open: true, message: "Recipe updated successfully", success: true });
     } catch (err) {
-      setModal({ open: true, message: "Recipe update failed", success: false });
+      const message = err.response?.data?.message || "Recipe update failed due to a network or server error.";
+      setModal({ open: true, message, success: false });
     } finally {
       setLoading(false);
     }
   };
 
-  const closeModal = () => {
+  const closeModal = (wasSuccess) => {
     setModal({ open: false, message: "", success: false });
-    if (modal.success) navigate("/manage");
+    if (wasSuccess) navigate("/"); // <-- FIX: Redirects to home page ("/") instead of "/manage"
   };
 
   useEffect(() => {
+    let mounted = true;
+
     const fetchRecipe = async () => {
       try {
         const res = await axios.get(`/api/recipes/${id}`);
-        setFormData({
-          title: res.data.title,
-          ingredients: res.data.ingredients.length ? res.data.ingredients : [""],
-          instructions: res.data.instructions,
-          category: res.data.category,
-          photoUrl: res.data.photoUrl,
-          cookingTime: res.data.cookingTime,
-        });
+        if (!mounted) return;
+
+        const imageUrl = res.data.image || "";
+
+        setFormData((prev) => ({
+          ...prev,
+          title: res.data.title || "",
+          ingredients: res.data.ingredients?.length ? res.data.ingredients : [""],
+          instructions: res.data.instructions || "",
+          category: res.data.category || "",
+          photoUrl: imageUrl,
+          imageFile: null,
+          cookingTime: res.data.cookingTime || "",
+          initialImageUrlWasPresent: !!imageUrl,
+        }));
       } catch (err) {
+        console.error("Failed to fetch recipe data:", err);
         setError("Failed to load recipe data.");
       }
     };
+
     fetchRecipe();
+
+    return () => {
+      mounted = false;
+      if (formData.photoUrl && formData.photoUrl.startsWith("blob:")) {
+        try { URL.revokeObjectURL(formData.photoUrl); } catch (e) {}
+      }
+    };
   }, [id]);
 
   return (
@@ -164,6 +226,7 @@ const EditRecipe = () => {
         )}
 
         <form onSubmit={handleSubmit} className="space-y-6">
+          {/* Title */}
           <div>
             <label className="block text-sm text-gray-400 mb-1">Title</label>
             <input
@@ -175,6 +238,7 @@ const EditRecipe = () => {
             />
           </div>
 
+          {/* Ingredients */}
           <div>
             <label className="block text-sm text-gray-400 mb-1">Ingredients</label>
             {formData.ingredients.map((ing, index) => (
@@ -206,6 +270,7 @@ const EditRecipe = () => {
             </button>
           </div>
 
+          {/* Instructions */}
           <div>
             <label className="block text-sm text-gray-400 mb-1">Instructions</label>
             <textarea
@@ -217,6 +282,7 @@ const EditRecipe = () => {
             />
           </div>
 
+          {/* Category */}
           <div>
             <label className="block text-sm text-gray-400 mb-1">Category</label>
             <select
@@ -225,9 +291,7 @@ const EditRecipe = () => {
               className="w-full px-4 py-3 rounded-lg bg-[#2a2a40] border border-[#33334d] text-gray-100 focus:ring-2 focus:ring-pink-500"
               required
             >
-              <option value="" disabled>
-                Select Category
-              </option>
+              <option value="" disabled>Select Category</option>
               <option value="Breakfast">Breakfast</option>
               <option value="Lunch">Lunch</option>
               <option value="Dinner">Dinner</option>
@@ -237,6 +301,7 @@ const EditRecipe = () => {
             </select>
           </div>
 
+          {/* Cooking Time */}
           <div>
             <label className="block text-sm text-gray-400 mb-1">Cooking Time (minutes)</label>
             <input
@@ -249,32 +314,56 @@ const EditRecipe = () => {
             />
           </div>
 
+          {/* IMAGE UPLOAD SECTION */}
           <div>
-            <label className="block text-sm text-gray-400 mb-1">Photo URL</label>
+            <label className="block text-sm text-gray-400 mb-1">Recipe Image (Upload)</label>
             <input
-              type="text"
-              value={formData.photoUrl}
-              onChange={(e) => handleInputChange("photoUrl", e.target.value)}
-              className="w-full px-4 py-3 rounded-lg bg-[#2a2a40] border border-[#33334d] text-gray-100 focus:ring-2 focus:ring-pink-500 mb-3"
-              required
+              type="file"
+              id="imageUpload"
+              name="image"  // <-- CRITICAL
+              accept="image/*"
+              onChange={handleFileChange}
+              className="hidden"
             />
+            <button
+              type="button"
+              onClick={() => document.getElementById("imageUpload").click()}
+              className="flex items-center justify-center w-full mb-3 px-4 py-3 rounded-lg bg-[#3a3a50] text-gray-200 hover:bg-[#4a4a60] transition font-medium"
+            >
+              <Upload className="w-5 h-5 mr-2" />
+              {formData.imageFile ? "Change Selected Image" : (formData.photoUrl ? "Update/Replace Image" : "Upload Image")}
+            </button>
+
             {formData.photoUrl && (
-              <img
-                src={formData.photoUrl}
-                alt="Preview"
-                className="w-full h-48 object-cover rounded-lg border border-[#444]"
-              />
+              <div className="w-full relative">
+                <img
+                  src={formData.photoUrl}
+                  alt="Preview"
+                  className="w-full h-48 object-cover rounded-lg border border-[#444]"
+                  onError={(e) => {
+                    e.target.onerror = null;
+                    e.target.src = "https://placehold.co/400x200/3a3a50/ffffff?text=Image+Not+Found";
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={handleClearImage}
+                  className="absolute top-2 right-2 p-1 bg-red-600 rounded-full text-white hover:bg-red-700 transition"
+                  aria-label="Remove Image"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
             )}
           </div>
 
+          {/* Submit */}
           <div className="text-center pt-4">
             <button
               type="submit"
               disabled={loading}
               className={`w-full bg-gradient-to-r from-purple-500 via-pink-500 to-red-500 text-white py-3 rounded-lg text-lg font-semibold hover:brightness-110 transition cursor-pointer
-              ${
-                loading ? "opacity-50 cursor-not-allowed" : ""
-              }`}
+              ${loading ? "opacity-50 cursor-not-allowed" : ""}`}
             >
               {loading ? "Updating..." : "Update Recipe"}
             </button>

@@ -110,11 +110,13 @@ const Explore = () => {
     setLoading(true);
     setError(null);
     try {
-      const res = await axios.get(
-        `/api/recipes/${
-          category && category !== "All" ? `?category=${category}` : ""
-        }`
-      );
+      // FIX: Correctly append the query string to the base URL
+      const endpoint = `/api/recipes${
+        category && category !== "All" ? `?category=${category}` : ""
+      }`;
+
+      const res = await axios.get(endpoint);
+      
       const data = sortByLatest(res.data);
       setRecipes(data);
       setFilteredRecipes(null);
@@ -423,6 +425,3 @@ const Explore = () => {
 };
 
 export default Explore;
-
-
-

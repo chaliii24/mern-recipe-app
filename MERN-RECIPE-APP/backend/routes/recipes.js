@@ -1,251 +1,198 @@
 import express from "express";
 import mongoose from "mongoose";
 import Recipe from "../models/Recipe.js";
+import User from "../models/User.js"; // 1. User model import for population
 import { protect } from "../middleware/auth.js";
-import { optionalAuth } from "../middleware/optionalAuth.js";
+import { optionalAuth } from "../middleware/optionalAuth.js"; // 2. Corrected import for optionalAuth
 import multer from "multer";
 
-// FIX: This pattern ensures packages originally written for CommonJS (like cloudinary)
-// can be imported correctly when the project uses ES Modules ("type": "module").
 import pkg from "cloudinary";
 const { v2: cloudinary } = pkg;
 import { CloudinaryStorage } from "multer-storage-cloudinary";
 
 const router = express.Router();
 
-// --- CLOUDINARY CONFIGURATION ---
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
-});
+/* =======================================================
+   CLOUDINARY CONFIGURATION
+========================================================== */
 
-// --- Cloudinary Storage Setup and Multer Middleware ---
-const storage = new CloudinaryStorage({
-  cloudinary: cloudinary,
-  params: {
-    folder: "Recipedia-Images",
-    allowed_formats: ["jpeg", "jpg", "png"],
-    transformation: [{ width: 800, height: 600, crop: "limit" }],
-    public_id: (req, file) => `recipe-${Date.now()}`,
-  },
-});
+let upload = multer({ storage: multer.memoryStorage() }); // fallback
 
-const upload = multer({ storage });
+const CLOUDINARY_CONFIG_OK =
+  process.env.CLOUDINARY_CLOUD_NAME &&
+  process.env.CLOUDINARY_API_KEY &&
+  process.env.CLOUDINARY_API_SECRET;
 
+if (CLOUDINARY_CONFIG_OK) {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+  });
 
-// =======================================================
-// POST /api/recipes - Create new recipe (PROTECTED)
-// =======================================================
-router.post("/", protect, upload.single("image"), async (req, res) => {
-  try {
-    const { title, description, instructions, category, cookingTime } = req.body;
+  const storage = new CloudinaryStorage({
+    cloudinary,
+    params: {
+      folder: "Recipedia-Images",
+      allowed_formats: ["jpeg", "jpg", "png"],
+      transformation: [{ width: 800, height: 600, crop: "limit" }],
+      public_id: () => `recipe-${Date.now()}`,
+    },
+  });
 
-    // 🔥 ROBUST INGREDIENT PARSING 🔥
-    let ingredientsArray = [];
-
-    // Case 1: Handle JSON stringified data or simple array/string
-    if (req.body.ingredients) {
-      try {
-        ingredientsArray = JSON.parse(req.body.ingredients);
-        if (!Array.isArray(ingredientsArray)) {
-          ingredientsArray = [req.body.ingredients];
-        }
-      } catch (e) {
-        if (Array.isArray(req.body.ingredients)) {
-          ingredientsArray = req.body.ingredients;
-        } else {
-          ingredientsArray = [req.body.ingredients];
-        }
-      }
-    }
-
-    // Case 2: Handle indexed keys from FormData
-    else {
-      ingredientsArray = Object.keys(req.body)
-        .filter(key => key.startsWith('ingredients['))
-        .sort()
-        .map(key => req.body[key]);
-    }
-
-    // Validation check
-    if (!title || ingredientsArray.length === 0 || !instructions || !category) {
-        // Clean up uploaded image if validation fails
-        if (req.file && req.file.path) {
-            const publicId = req.file.path.split('/').pop().split('.')[0];
-            await cloudinary.uploader.destroy(publicId).catch(cleanupErr => console.error("Cloudinary cleanup failed on validation error:", cleanupErr));
-        }
-        return res.status(400).json({ message: "Please fill all required fields (title, ingredients, instructions, category)." });
-    }
-
-    // req.file.path contains the permanent Cloudinary URL
-    const imageUrl = req.file ? req.file.path : null;
-
-    const recipe = new Recipe({
-      title,
-      description,
-      ingredients: ingredientsArray.filter(Boolean),
-      instructions,
-      category,
-      cookingTime,
-      image: imageUrl,
-      createdBy: req.user._id,
-    });
-
-    await recipe.save();
-    res.status(201).json(recipe);
-
-  } catch (error) {
-    // Attempt to clean up image on generic server error
-    if (req.file && req.file.path) {
-      const publicId = req.file.path.split('/').pop().split('.')[0];
-      await cloudinary.uploader.destroy(publicId).catch(cleanupErr => console.error("Cloudinary cleanup failed on server error:", cleanupErr));
-    }
-    console.error("❌ Recipe creation failed:", error);
-    res.status(500).json({
-      message: "Failed to create recipe due to a server error.",
-      detail: error.message
-    });
-  }
-});
+  upload = multer({ storage });
+  console.log("Cloudinary configured successfully.");
+} else {
+  console.warn("⚠️ Cloudinary env variables missing. Upload/delete will NOT work.");
+}
 
 
-// =======================================================
-// GET /api/recipes - Fetch all recipes
-// =======================================================
+/* =======================================================
+   GET ALL RECIPES (EXPLORE VIEW)
+   🔥 FIX: Added .populate() to show creator username
+========================================================== */
 router.get("/", optionalAuth, async (req, res) => {
   const { category } = req.query;
   try {
     const query = category ? { category } : {};
-    const recipes = await Recipe.find(query).sort({ createdAt: -1 });
+    // 🚨 FIX: Populate createdBy to replace ID with username object
+    const recipes = await Recipe.find(query)
+      .sort({ createdAt: -1 })
+      .populate("createdBy", "username"); 
+    
+    // Check if user is logged in to determine liked status
     const recipesWithLike = recipes.map((r) => ({
       ...r.toObject(),
       likedByUser: req.user ? r.likedBy.some((id) => id.equals(req.user._id)) : false,
+      likes: r.likedBy.length,
     }));
+
     res.json(recipesWithLike);
-  } catch (error) {
+  } catch(err) {
+    console.error("❌ Error fetching all recipes:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-// =======================================================
-// GET /api/recipes/latest - Get latest 3
-// =======================================================
-router.get("/latest", async (req, res) => {
-  try {
-    const recipes = await Recipe.find().sort({ createdAt: -1 }).limit(3);
-    res.json(recipes);
-  } catch (err) {
-    res.status(500).json({ message: "Failed to fetch latest recipes" });
-  }
-});
 
-// =======================================================
-// GET /api/recipes/search/query - Search
-// =======================================================
+/* =======================================================
+   SEARCH RECIPES BY TITLE
+========================================================== */
 router.get("/search/query", optionalAuth, async (req, res) => {
   const { q } = req.query;
   try {
     const regex = new RegExp(q, "i");
-    const recipes = await Recipe.find({ title: regex });
+    const recipes = await Recipe.find({ title: regex })
+      .populate("createdBy", "username"); // Populate for search results too
+
     const recipesWithLike = recipes.map((r) => ({
       ...r.toObject(),
       likedByUser: req.user ? r.likedBy.some((id) => id.equals(req.user._id)) : false,
+      likes: r.likedBy.length,
     }));
+
     res.json(recipesWithLike);
-  } catch (error) {
+  } catch(err) {
+    console.error("❌ Error searching recipes:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-// ====================== Protected Routes ====================== //
 
-// Get current user's own recipes
-router.get("/my", protect, async (req, res) => {
+/* =======================================================
+   GET LATEST RECIPES (Homepage)
+   🔥 FIX: Added .populate() to show creator username
+========================================================== */
+router.get("/latest", optionalAuth, async (req, res) => {
   try {
-    const recipes = await Recipe.find({ createdBy: req.user._id }).sort({ createdAt: -1 });
-    res.json(recipes);
+    // 🚨 FIX: Populate createdBy to replace ID with username object
+    const latestRecipes = await Recipe.find()
+      .sort({ createdAt: -1 })
+      .limit(3)
+      .populate("createdBy", "username"); 
+    
+    const recipesWithLike = latestRecipes.map((r) => ({
+      ...r.toObject(),
+      likedByUser: req.user ? r.likedBy.some((id) => id.equals(req.user._id)) : false,
+      likes: r.likedBy.length,
+    }));
+    
+    res.json(recipesWithLike);
   } catch (err) {
-    res.status(500).json({ message: "Failed to fetch your recipes" });
+    console.error("❌ Latest recipes fetch failed:", err);
+    res.status(500).json({ message: "Server error" });
   }
 });
 
-// Get user's liked recipes
+
+/* =======================================================
+   GET MY RECIPES
+========================================================== */
+router.get("/my", protect, async (req, res) => {
+  try {
+    const recipes = await Recipe.find({ createdBy: req.user._id })
+      .sort({ createdAt: -1 });
+
+    res.json(recipes);
+  } catch (err) {
+    console.error("❌ User recipes fetch failed:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+/* =======================================================
+   GET USER'S LIKED RECIPES
+========================================================== */
 router.get("/favorites", protect, async (req, res) => {
   try {
     const { q } = req.query;
     const searchFilter = q ? { title: new RegExp(q, "i") } : {};
     const userId = new mongoose.Types.ObjectId(req.user._id);
-    const favorites = await Recipe.find({ likedBy: userId, ...searchFilter }).sort({ createdAt: -1 });
+
+    const favorites = await Recipe.find({
+      likedBy: userId,
+      ...searchFilter,
+    }).sort({ createdAt: -1 })
+      .populate("createdBy", "username"); // Populate for favorites view
+
     res.json(favorites);
-  } catch (err) {
+  } catch(err) {
+    console.error("❌ Failed to fetch liked recipes:", err);
     res.status(500).json({ message: "Failed to fetch liked recipes" });
   }
 });
 
-// Update a recipe
-router.put("/:id", protect, upload.single("image"), async (req, res) => {
+
+/* =======================================================
+   GET BY ID (Single Recipe View)
+   🔥 FIX: Includes .populate() to show creator username on detail page
+========================================================== */
+router.get("/:id", optionalAuth, async (req, res) => {
   try {
-    const recipe = await Recipe.findById(req.params.id);
+    if (!mongoose.Types.ObjectId.isValid(req.params.id))
+      return res.status(400).json({ message: "Invalid ID" });
+
+    // 🚨 FIX: Populate createdBy field, retrieving only the username and email
+    const recipe = await Recipe.findById(req.params.id).populate("createdBy", "username email");
     if (!recipe) return res.status(404).json({ message: "Recipe not found" });
 
-    if (recipe.createdBy.toString() !== req.user._id.toString()) {
-      return res.status(401).json({ message: "Not authorized" });
-    }
-    
-    const { title, ingredients, instructions, category, cookingTime } = req.body;
-    
-    // Handle potential new image upload
-    if (req.file && req.file.path) {
-      // Delete old image from Cloudinary
-      if (recipe.image) {
-        const publicId = recipe.image.split("/").pop().split(".")[0];
-        await cloudinary.uploader.destroy(publicId);
-      }
-      recipe.image = req.file.path;
-    }
+    const likedByUser = req.user ? recipe.likedBy.some((id) => id.equals(req.user._id)) : false;
 
-    if (title) recipe.title = title;
-    if (ingredients) recipe.ingredients = ingredients;
-    if (instructions) recipe.instructions = instructions;
-    if (category) recipe.category = category;
-    if (cookingTime) recipe.cookingTime = cookingTime;
-
-    await recipe.save();
-    res.json({ message: "Recipe updated successfully", recipe });
+    res.json({
+      ...recipe.toObject(),
+      likedByUser,
+      likes: recipe.likedBy.length,
+    });
   } catch (err) {
-    console.error("❌ Recipe update failed:", err);
-    res.status(500).json({ message: "Failed to update recipe" });
-  }
-});
-
-// Delete a recipe 
-router.delete("/:id", protect, async (req, res) => {
-  try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ message: "Invalid ID" });
-    const recipe = await Recipe.findById(req.params.id);
-    if (!recipe) return res.status(404).json({ message: "Recipe not found" });
-
-    const isAdmin = req.user.email === "admin@gmail.com"; 
-    const isOwner = recipe.createdBy.toString() === req.user._id.toString();
-
-    if (!isOwner && !isAdmin) return res.status(401).json({ message: "Not authorized" });
-
-    // Delete image from Cloudinary before deleting the document
-    if (recipe.image) {
-      const publicId = recipe.image.split("/").pop().split(".")[0];
-      await cloudinary.uploader.destroy(publicId);
-    }
-
-    await recipe.deleteOne();
-    res.json({ message: "Recipe deleted" });
-  } catch (err) {
-    console.error("❌ Recipe delete failed:", err);
+    console.error("❌ Error fetching recipe:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-// Toggle like
+
+/* =======================================================
+   LIKE / UNLIKE A RECIPE
+========================================================== */
 router.post("/:id/like", protect, async (req, res) => {
   try {
     const recipe = await Recipe.findById(req.params.id);
@@ -255,57 +202,182 @@ router.post("/:id/like", protect, async (req, res) => {
     const likedIndex = recipe.likedBy.findIndex((id) => id.equals(userId));
 
     if (likedIndex === -1) {
-      recipe.likes = (recipe.likes || 0) + 1;
       recipe.likedBy.push(userId);
     } else {
-      recipe.likes = Math.max((recipe.likes || 1) - 1, 0);
       recipe.likedBy.splice(likedIndex, 1);
     }
+
     await recipe.save();
-    res.json({ likes: recipe.likes, likedByUser: likedIndex === -1 });
-  } catch (err) {
+    res.json({ likedByUser: likedIndex === -1, likes: recipe.likedBy.length });
+  } catch(err) {
+    console.error("❌ Like/Unlike failed:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-// Rate
-router.post("/:id/rate", protect, async (req, res) => {
-  try {
-    const { value } = req.body;
-    if (!value || value < 1 || value > 5) return res.status(400).json({ message: "Rating must be 1-5" });
 
+/* =======================================================
+   CREATE RECIPE (multipart/form-data)
+========================================================== */
+router.post("/", protect, upload.single("image"), async (req, res) => {
+  try {
+    const { title, description, instructions, category, cookingTime } = req.body;
+
+    // INGREDIENT PARSING
+    let ingredientsArray = [];
+
+    if (req.body.ingredients) {
+      try {
+        ingredientsArray = JSON.parse(req.body.ingredients);
+        if (!Array.isArray(ingredientsArray)) {
+          ingredientsArray = [req.body.ingredients];
+        }
+      } catch {
+        ingredientsArray = Array.isArray(req.body.ingredients)
+          ? req.body.ingredients
+          : [req.body.ingredients];
+      }
+    } else {
+      ingredientsArray = Object.keys(req.body)
+        .filter((k) => k.startsWith("ingredients["))
+        .sort()
+        .map((k) => req.body[k]);
+    }
+
+    if (!title || !instructions || !category || ingredientsArray.length === 0) {
+      return res.status(400).json({
+        message:
+          "Missing required fields: title, ingredients, instructions, category",
+      });
+    }
+
+    const imageUrl = req.file
+      ? req.file.path || req.file.secure_url
+      : null;
+
+    const recipe = new Recipe({
+      title,
+      description,
+      instructions,
+      category,
+      cookingTime,
+      ingredients: ingredientsArray.filter(Boolean),
+      image: imageUrl,
+      createdBy: req.user._id,
+    });
+
+    await recipe.save();
+    res.status(201).json(recipe);
+  } catch (err) {
+    console.error("❌ Recipe creation failed:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+
+/* =======================================================
+   UPDATE RECIPE (multipart/form-data)
+========================================================== */
+router.put("/:id", protect, upload.single("image"), async (req, res) => {
+  try {
     const recipe = await Recipe.findById(req.params.id);
     if (!recipe) return res.status(404).json({ message: "Recipe not found" });
 
-    const userId = req.user._id.toString();
-    const existing = recipe.ratings.findIndex((r) => r.user.toString() === userId);
+    const isAdmin = req.user.email === "admin@gmail.com";
+    const isOwner = recipe.createdBy.toString() === req.user._id.toString();
 
-    if (existing !== -1) recipe.ratings[existing].value = value;
-    else recipe.ratings.push({ user: userId, value });
+    if (!isAdmin && !isOwner)
+      return res.status(401).json({ message: "Not authorized" });
 
-    recipe.rating = recipe.ratings.reduce((acc, r) => acc + r.value, 0) / recipe.ratings.length;
+    // Parse ingredients
+    let ingredientsArray = [];
+    if (req.body.ingredients) {
+      ingredientsArray = Array.isArray(req.body.ingredients)
+        ? req.body.ingredients
+        : [req.body.ingredients];
+    } else {
+      ingredientsArray = Object.keys(req.body)
+        .filter((k) => k.startsWith("ingredients["))
+        .sort()
+        .map((k) => req.body[k]);
+    }
+
+    /* -----------------------------
+       IMAGE HANDLING
+    ------------------------------ */
+    if (req.file) {
+      const newImageUrl = req.file.path || req.file.secure_url;
+
+      if (newImageUrl) {
+        // delete old image
+        if (recipe.image && CLOUDINARY_CONFIG_OK) {
+          const publicId = recipe.image.split("/").slice(-1)[0].split(".")[0];
+          await cloudinary.uploader.destroy(publicId).catch((err) =>
+            console.error("Failed deleting old image:", err)
+          );
+        }
+        recipe.image = newImageUrl;
+      }
+    } else if (req.body.clearImage === "true") {
+      if (recipe.image && CLOUDINARY_CONFIG_OK) {
+        const publicId = recipe.image.split("/").slice(-1)[0].split(".")[0];
+        await cloudinary.uploader.destroy(publicId);
+      }
+      recipe.image = "";
+    }
+
+    // Update fields
+    if (req.body.title) recipe.title = req.body.title;
+    if (req.body.description) recipe.description = req.body.description;
+    if (req.body.instructions) recipe.instructions = req.body.instructions;
+    if (req.body.category) recipe.category = req.body.category;
+    if (req.body.cookingTime) recipe.cookingTime = req.body.cookingTime;
+
+    if (ingredientsArray.length > 0) {
+      recipe.ingredients = ingredientsArray.filter((i) => i.trim() !== "");
+    }
+
     await recipe.save();
-    res.json({ rating: recipe.rating, userRating: value });
+    res.json({ message: "Recipe updated successfully", recipe });
+
   } catch (err) {
+    console.error("❌ Update failed:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-// Get Single Recipe
-router.get("/:id", optionalAuth, async (req, res) => {
+
+/* =======================================================
+   DELETE RECIPE
+========================================================== */
+router.delete("/:id", protect, async (req, res) => {
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ message: "Recipe not found" });
-    const recipe = await Recipe.findById(req.params.id).populate("createdBy", "username email");
+    const recipe = await Recipe.findById(req.params.id);
     if (!recipe) return res.status(404).json({ message: "Recipe not found" });
 
-    const likedByUser = req.user ? recipe.likedBy.some((id) => id.equals(req.user._id)) : false;
-    res.json({ ...recipe.toObject(), likedByUser });
+    const isAdmin = req.user.email === "admin@gmail.com";
+    const isOwner = recipe.createdBy.toString() === req.user._id.toString();
+
+    if (!isAdmin && !isOwner)
+      return res.status(401).json({ message: "Not authorized" });
+
+    // delete image
+    if (recipe.image && CLOUDINARY_CONFIG_OK) {
+      const publicId = recipe.image.split("/").slice(-1)[0].split(".")[0];
+      await cloudinary.uploader.destroy(publicId);
+    }
+
+    await recipe.deleteOne();
+    res.json({ message: "Recipe deleted" });
+
   } catch (err) {
+    console.error("❌ Delete failed:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
 
 export default router;
+// ... rest of your uncommented routes (e.g., router.get("/"), router.get("/favorites"), etc.) should follow.
 
 // ... rest of your routes (e.g., router.get("/"), router.get("/:id"), etc.)
 
